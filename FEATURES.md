@@ -14,9 +14,7 @@ optional in-vehicle display
 - Probe leads 2 m or 5 m
 - Plug-in probe connectors
 - Runs on 12 V vehicle power, no batteries
-- Transmits wirelessly over standard protocols — works with regular lap
-  timing / monitoring apps (RaceChrono, BLE sensor monitors) with or
-  without the display
+- Transmits wirelessly over standard protocols: works with regular lap timing / monitoring apps (RaceChrono, BLE sensor monitors) with or without the display
 
 ## Optional in-vehicle display
 
