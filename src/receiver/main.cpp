@@ -1,11 +1,13 @@
 // Brake32 RECEIVER — Waveshare ESP32-C6-LCD-1.47 (W30381)
 // ESP-NOW in -> zone-colour display + RaceChrono DIY BLE out
+// Optional: plain-ASCII sensor output over USB-CDC for DashSSM head units.
 //
 // BOOT button (GPIO9): press = reset session MIN/MAX readings
 //
 // RaceChrono setup (once, in the app):
-//   Add device -> "BLE DIY device", pick "Brake32" (sender, primary)\n//   or "Brake32-Dash" (this display, backup).
-//   Add channels reading CAN id 0x100:
+//   Add device -> "BLE DIY device", pick "Brake32-NN" (sender, primary)
+//   or "Brake32-Dash-NN" (this display, backup). Type: CAN-Bus.
+//   Vehicle profile -> CAN-Bus channels, CAN id 0x100 (256):
 //     Pad temp:     bytesToUintLe(raw, 0, 2) * 0.1
 //     Caliper temp: bytesToUintLe(raw, 2, 2) * 0.1
 
@@ -20,9 +22,8 @@
 #include "../common/packet.h"
 
 // ---------- Display: ST7789 172x320 on the Waveshare C6 1.47" ----------
-// Pin map per Waveshare wiki for ESP32-C6-LCD-1.47 — verify against the
-// wiki page for W30381 if the panel stays dark: MOSI 6, SCLK 7, CS 14,
-// DC 15, RST 21, Backlight 22.
+// Pin map per Waveshare wiki for ESP32-C6-LCD-1.47: MOSI 6, SCLK 7, CS 14,
+// DC 15, RST 21, Backlight 22. WS2812 RGB LED on GPIO 8.
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI      _bus;
@@ -74,6 +75,15 @@ float minPad = 9999, minCal = 9999;
 
 static const int PIN_BTN = 9;           // BOOT button
 
+// ---------- DashSSM external sensor output (USB serial) ----------
+// DashSSM listens for plain ASCII lines: "pad,caliper\r\n" at 9600 8N1, 10 Hz.
+// We send real degrees C; keep app-side scale/offset at 1/0. Faults send -999 so
+// the gauge shows an obviously-wrong value instead of holding the last reading.
+// Native USB CDC is supported, so the C6's own USB cable is all that's needed.
+// App: Settings -> External sensors -> Add -> "Two numbers per line";
+//   Reading 1 = pad (position 1), Reading 2 = caliper (position 2), unit degC.
+static const bool DASHSSM_OUTPUT = true;
+
 // Colour thresholds (deg C) — tune after first runs
 static const float PAD_COLD = 60,  PAD_AMBER = 300, PAD_RED = 450;
 static const float CAL_COLD = 50,  CAL_AMBER = 150, CAL_RED = 220;
@@ -90,6 +100,32 @@ static Zone zoneOf(float t, float cold, float amber, float red, bool fault,
   return Z_GREEN;
 }
 
+static uint16_t zoneColour(Zone z) {
+  switch (z) {
+    case Z_STALE: return canvas.color565(70, 70, 70);
+    case Z_FAULT: return canvas.color565(90, 40, 120);   // purple = sensor fault
+    case Z_RED:   return canvas.color565(200, 30, 30);
+    case Z_AMBER: return canvas.color565(220, 140, 0);
+    case Z_COLD:  return canvas.color565(25, 80, 190);   // blue = not up to temp
+    default:      return canvas.color565(20, 130, 50);
+  }
+}
+
+// ---------- Onboard WS2812 RGB LED (GPIO8 on the Waveshare C6 board) ----------
+static const int PIN_RGB = 8;
+static void ledShow(Zone z) {
+  uint8_t r = 0, g = 0, b = 0;               // modest brightness for night driving
+  switch (z) {
+    case Z_STALE: r = 8;  g = 8;  b = 8;  break;
+    case Z_FAULT: r = 30; g = 0;  b = 40; break;
+    case Z_RED:   r = 60; g = 0;  b = 0;  break;
+    case Z_AMBER: r = 55; g = 30; b = 0;  break;
+    case Z_COLD:  r = 0;  g = 5;  b = 55; break;
+    default:      r = 0;  g = 40; b = 5;  break;   // green
+  }
+  rgbLedWrite(PIN_RGB, r, g, b);
+}
+
 // ---------- RaceChrono DIY BLE ----------
 BLECharacteristic *canChar = nullptr;
 
@@ -99,10 +135,15 @@ struct __attribute__((packed)) RcFrame {
   uint16_t cal10;
 };
 
+// RaceChrono writes PID-filter commands here after connecting; a CAN-Bus
+// DIY device must expose this characteristic or the app hangs at
+// "Connecting...". We accept and ignore the commands (send everything).
 class FilterCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override { /* accept, ignore */ }
 };
 
+// Restart advertising whenever the phone disconnects, otherwise the board
+// goes invisible after the first connection ends.
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override {}
   void onDisconnect(BLEServer *s) override { BLEDevice::startAdvertising(); }
@@ -162,32 +203,6 @@ static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data,
 }
 
 // ---------- UI ----------
-static uint16_t zoneColour(Zone z) {
-  switch (z) {
-    case Z_STALE: return canvas.color565(70, 70, 70);
-    case Z_FAULT: return canvas.color565(90, 40, 120);   // purple = sensor fault
-    case Z_RED:   return canvas.color565(200, 30, 30);
-    case Z_AMBER: return canvas.color565(220, 140, 0);
-    case Z_COLD:  return canvas.color565(25, 80, 190);   // blue = not up to temp
-    default:      return canvas.color565(20, 130, 50);
-  }
-}
-
-// ---------- Onboard WS2812 RGB LED (GPIO8 on the Waveshare C6 board) ----------
-static const int PIN_RGB = 8;
-static void ledShow(Zone z) {
-  uint8_t r = 0, g = 0, b = 0;               // modest brightness for night driving
-  switch (z) {
-    case Z_STALE: r = 8;  g = 8;  b = 8;  break;
-    case Z_FAULT: r = 30; g = 0;  b = 40; break;
-    case Z_RED:   r = 60; g = 0;  b = 0;  break;
-    case Z_AMBER: r = 55; g = 30; b = 0;  break;
-    case Z_COLD:  r = 0;  g = 5;  b = 55; break;
-    default:      r = 0;  g = 40; b = 5;  break;   // green
-  }
-  rgbLedWrite(PIN_RGB, r, g, b);
-}
-
 static void drawBand(int y, int h, const char *label, float t, float mn,
                      float peak, uint16_t bg, bool fault, bool stale) {
   canvas.fillRect(0, y, 320, h, bg);
@@ -216,7 +231,7 @@ static void drawBand(int y, int h, const char *label, float t, float mn,
     canvas.drawString(buf, 168, (topRow + botRow) / 2);
   }
 
-  // Session max, small, bottom-right
+  // Session max, bottom-right
   canvas.setTextDatum(bottom_right);
   canvas.setTextSize(2);
   char mbuf[20];
@@ -224,6 +239,7 @@ static void drawBand(int y, int h, const char *label, float t, float mn,
   else           snprintf(mbuf, sizeof(mbuf), "%.0f", peak);
   canvas.drawString(mbuf, 312, y + h - 4);
 
+  // Session min, bottom-left
   canvas.setTextDatum(bottom_left);
   canvas.setTextSize(2);
   char nbuf[20];
@@ -258,13 +274,15 @@ static void pollButton() {
   if (down && !wasDown) downAt = millis();
   if (!down && wasDown) {
     uint32_t held = millis() - downAt;
-    if (held > 30) { peakPad = 0; peakCal = 0; minPad = 9999; minCal = 9999; }   // any press: reset session min/max
+    if (held > 30) { peakPad = 0; peakCal = 0; minPad = 9999; minCal = 9999; }
   }
   wasDown = down;
 }
 
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(10);  // small cap: don't hang the loop, but let the
+                              // CDC FIFO recover when the host attaches late
   pinMode(PIN_BTN, INPUT_PULLUP);
 
   tft.init();
@@ -291,5 +309,17 @@ void loop() {
     lastBle = millis();
     bleNotify();
   }
+
+  if (DASHSSM_OUTPUT) {
+    static uint32_t lastTx = 0;
+    if (millis() - lastTx >= 100) {   // 10 Hz
+      lastTx = millis();
+      bool stale = !everRx || (millis() - lastRxMs) > 3000;
+      float pad = (stale || latest.padFault) ? -999.0f : latest.padC;
+      float cal = (stale || latest.calFault) ? -999.0f : latest.calC;
+      Serial.printf("%.1f,%.1f\r\n", pad, cal);
+    }
+  }
+
   delay(33);                            // ~30 fps UI
 }
