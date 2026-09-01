@@ -84,6 +84,42 @@ static const int PIN_BTN = 9;           // BOOT button
 //   Reading 1 = pad (position 1), Reading 2 = caliper (position 2), unit degC.
 static const bool DASHSSM_OUTPUT = true;
 
+// A write that goes nowhere, and what to do about it.
+//
+// Arduino's USB CDC only writes when it believes a host is attached, and it
+// learns that from a connection event. A head unit powers this board up at the
+// same moment it boots itself, so it can enumerate us while we are still in
+// setup() - and then the event never arrives, every write is dropped in
+// silence, and the display goes on updating as though nothing is wrong. That is
+// the fault exactly as the car showed it: a live screen, a perfectly enumerated
+// device, and an app whose every read timed out with nothing behind it.
+// Unplugging cured it because a fresh enumeration is a fresh connection event.
+//
+// So the writes are watched. Three seconds of them returning nothing and the
+// serial is torn down and brought back up, which asks the driver what the truth
+// is now rather than trusting what it decided at boot. No restart and nothing
+// visible on the display. A parked car with no app running costs nothing
+// either: no host is not an error, so the re-init simply finds the same answer
+// and the loop carries on.
+static const uint16_t DASHSSM_STUCK_WRITES = 30;   // three seconds at 10 Hz
+
+static void dashssmSend(float pad, float cal) {
+  static uint16_t stuckWrites = 0;
+
+  if (Serial.printf("%.1f,%.1f\r\n", pad, cal) > 0) {
+    stuckWrites = 0;
+    return;
+  }
+
+  if (++stuckWrites < DASHSSM_STUCK_WRITES) return;
+  stuckWrites = 0;
+  Serial.end();
+  delay(20);
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(10);
+}
+
+
 // Colour thresholds (deg C) — tune after first runs
 static const float PAD_COLD = 60,  PAD_AMBER = 300, PAD_RED = 450;
 static const float CAL_COLD = 50,  CAL_AMBER = 150, CAL_RED = 220;
@@ -317,7 +353,7 @@ void loop() {
       bool stale = !everRx || (millis() - lastRxMs) > 3000;
       float pad = (stale || latest.padFault) ? -999.0f : latest.padC;
       float cal = (stale || latest.calFault) ? -999.0f : latest.calC;
-      Serial.printf("%.1f,%.1f\r\n", pad, cal);
+      dashssmSend(pad, cal);
     }
   }
 
