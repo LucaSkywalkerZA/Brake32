@@ -93,26 +93,40 @@ static const bool DASHSSM_OUTPUT = true;
 // silence, and the display goes on updating as though nothing is wrong. That is
 // the fault exactly as the car showed it: a live screen, a perfectly enumerated
 // device, and an app whose every read timed out with nothing behind it.
-// Unplugging cured it because a fresh enumeration is a fresh connection event.
 //
-// So the writes are watched. Three seconds of them returning nothing and the
-// serial is torn down and brought back up, which asks the driver what the truth
-// is now rather than trusting what it decided at boot. No restart and nothing
-// visible on the display. A parked car with no app running costs nothing
-// either: no host is not an error, so the re-init simply finds the same answer
-// and the loop carries on.
+// Bringing the serial back up fixes it, and has to be done sparingly, because
+// doing so re-enumerates us on the bus - and the head unit launches DashSSM
+// whenever this board appears. Re-initialising every three seconds therefore
+// dragged the driver back into the app every three seconds, which is a good
+// deal worse than the fault it was fixing.
+//
+// So it is bounded twice over. It only ever runs before the first successful
+// write, because the bug is precisely that the connection event was missed at
+// boot: once anything has got through, the event plainly arrived, and writes
+// failing after that just mean the app was closed - which is not our business.
+// And it gives up after a few tries, each waiting longer than the last, so a
+// car running with no app installed settles down instead of announcing itself
+// for the whole drive.
 static const uint16_t DASHSSM_STUCK_WRITES = 30;   // three seconds at 10 Hz
+static const uint8_t  DASHSSM_MAX_REINITS  = 5;    // then leave the bus alone
 
 static void dashssmSend(float pad, float cal) {
   static uint16_t stuckWrites = 0;
+  static uint8_t  reinits     = 0;
+  static bool     everSent    = false;
 
   if (Serial.printf("%.1f,%.1f\r\n", pad, cal) > 0) {
+    everSent = true;
     stuckWrites = 0;
     return;
   }
 
-  if (++stuckWrites < DASHSSM_STUCK_WRITES) return;
+  if (everSent || reinits >= DASHSSM_MAX_REINITS) return;
+  // Each attempt waits twice as long as the last: 3 s, 6 s, 12 s, 24 s, 48 s.
+  if (++stuckWrites < (uint16_t)(DASHSSM_STUCK_WRITES << reinits)) return;
+
   stuckWrites = 0;
+  reinits++;
   Serial.end();
   delay(20);
   Serial.begin(115200);
